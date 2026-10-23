@@ -82,7 +82,9 @@ export default function HomePage() {
 
   // Single video download options
   const [selectedFormatId, setSelectedFormatId] = useState<string>('best-mp4');
-  const [isDownloading, setIsDownloading] = useState(false);
+  const [activeDownloadKey, setActiveDownloadKey] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const [downloadStatusText, setDownloadStatusText] = useState<string>('');
 
   // Playlist options
   const [selectedItems, setSelectedItems] = useState<Record<string, boolean>>({});
@@ -134,18 +136,111 @@ export default function HomePage() {
     }
   };
 
-  // Trigger single item download
-  const handleSingleDownload = (formatId: string, customTitle?: string, overrideUrl?: string) => {
+  // Trigger single item download with progress bar and loading feedback
+  const handleSingleDownload = async (
+    formatId: string, 
+    customTitle?: string, 
+    overrideUrl?: string, 
+    downloadKey: string = 'main'
+  ) => {
+    if (activeDownloadKey) return; // Prevent concurrent single downloads
+
     const targetUrl = overrideUrl || (result as SingleVideoResult)?.rawUrl || inputUrl;
     const downloadUrl = `/api/download?url=${encodeURIComponent(targetUrl)}&formatId=${encodeURIComponent(formatId)}${customTitle ? `&title=${encodeURIComponent(customTitle)}` : ''}`;
     
-    // Trigger direct browser download
+    setActiveDownloadKey(downloadKey);
+    setDownloadProgress(0);
+    setDownloadStatusText('Processing & downloading media...');
+
+    try {
+      const response = await fetch(downloadUrl);
+      if (!response.ok) {
+        let errorMsg = 'Download failed';
+        try {
+          const errData = await response.json();
+          errorMsg = errData.error || errorMsg;
+        } catch {
+          errorMsg = `Server returned ${response.status} ${response.statusText}`;
+        }
+        throw new Error(errorMsg);
+      }
+
+      const contentLengthHeader = response.headers.get('Content-Length');
+      const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
+
+      // Extract filename from Content-Disposition if present
+      let filename = customTitle ? `${customTitle}.${formatId.includes('mp3') ? 'mp3' : 'mp4'}` : 'download';
+      const disposition = response.headers.get('Content-Disposition');
+      if (disposition) {
+        const utf8FilenameMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+        if (utf8FilenameMatch && utf8FilenameMatch[1]) {
+          filename = decodeURIComponent(utf8FilenameMatch[1]);
+        } else {
+          const standardFilenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+          if (standardFilenameMatch && standardFilenameMatch[1]) {
+            filename = standardFilenameMatch[1];
+          }
+        }
+      }
+
+      if (!response.body) {
+        const blob = await response.blob();
+        triggerBlobDownload(blob, filename);
+        return;
+      }
+
+      // Stream the reader to calculate live progress
+      const reader = response.body.getReader();
+      const chunks: BlobPart[] = [];
+      let receivedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (value) {
+          chunks.push(value);
+          receivedBytes += value.length;
+
+          if (totalBytes > 0) {
+            const pct = Math.min(100, Math.round((receivedBytes / totalBytes) * 100));
+            setDownloadProgress(pct);
+            setDownloadStatusText(`Downloading: ${pct}% (${(receivedBytes / (1024 * 1024)).toFixed(1)} MB / ${(totalBytes / (1024 * 1024)).toFixed(1)} MB)`);
+          } else {
+            setDownloadStatusText(`Downloading: ${(receivedBytes / (1024 * 1024)).toFixed(1)} MB transferred`);
+          }
+        }
+      }
+
+      setDownloadProgress(100);
+      setDownloadStatusText('Saving file to your device...');
+
+      const fullBlob = new Blob(chunks, {
+        type: response.headers.get('Content-Type') || (formatId.includes('mp3') ? 'audio/mpeg' : 'video/mp4')
+      });
+      triggerBlobDownload(fullBlob, filename);
+    } catch (err: any) {
+      alert(`Download error: ${err.message || 'Failed to complete download.'}`);
+    } finally {
+      setTimeout(() => {
+        setActiveDownloadKey(null);
+        setDownloadProgress(null);
+        setDownloadStatusText('');
+      }, 1200);
+    }
+  };
+
+  const triggerBlobDownload = (blob: Blob, filename: string) => {
+    const blobUrl = window.URL.createObjectURL(blob);
     const anchor = document.createElement('a');
-    anchor.href = downloadUrl;
-    anchor.download = '';
+    anchor.href = blobUrl;
+    anchor.download = filename;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
+    setTimeout(() => {
+      window.URL.revokeObjectURL(blobUrl);
+    }, 2000);
   };
 
   // Trigger playlist batch zip download
@@ -356,19 +451,33 @@ export default function HomePage() {
                     {/* Quick MP3 One-Click Convert */}
                     <div className="flex flex-wrap items-center gap-3 pt-2">
                       <button
-                        onClick={() => handleSingleDownload('mp3-high', video.title)}
-                        className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center space-x-2 shadow-lg shadow-emerald-600/20 transition-all"
+                        disabled={!!activeDownloadKey}
+                        onClick={() => handleSingleDownload('mp3-high', video.title, undefined, 'quick-mp3')}
+                        className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold flex items-center space-x-2 shadow-lg shadow-emerald-600/20 transition-all"
                       >
-                        <FileAudio className="w-4 h-4" />
-                        <span>Quick Convert to MP3 (320kbps)</span>
+                        {activeDownloadKey === 'quick-mp3' ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <FileAudio className="w-4 h-4" />
+                        )}
+                        <span>
+                          {activeDownloadKey === 'quick-mp3' ? 'Processing MP3...' : 'Quick Convert to MP3 (320kbps)'}
+                        </span>
                       </button>
 
                       <button
-                        onClick={() => handleSingleDownload('best-mp4', video.title)}
-                        className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center space-x-2 shadow-lg shadow-rose-600/20 transition-all"
+                        disabled={!!activeDownloadKey}
+                        onClick={() => handleSingleDownload('best-mp4', video.title, undefined, 'quick-mp4')}
+                        className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold flex items-center space-x-2 shadow-lg shadow-rose-600/20 transition-all"
                       >
-                        <Film className="w-4 h-4" />
-                        <span>Best Video (MP4)</span>
+                        {activeDownloadKey === 'quick-mp4' ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Film className="w-4 h-4" />
+                        )}
+                        <span>
+                          {activeDownloadKey === 'quick-mp4' ? 'Processing MP4...' : 'Best Video (MP4)'}
+                        </span>
                       </button>
                     </div>
                   </div>
@@ -435,24 +544,61 @@ export default function HomePage() {
                   </div>
 
                   {/* Bottom Download Action */}
-                  <div className="mt-6 pt-5 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
-                    <div className="text-xs text-slate-400">
-                      Selected: <span className="text-slate-200 font-medium">
-                        {video.formats.find(f => f.format_id === selectedFormatId)?.qualityLabel || 'Default'}
-                      </span>
-                      {' '}&bull;{' '}
-                      Size Guide: <span className="text-emerald-400 font-medium">
-                        {video.formats.find(f => f.format_id === selectedFormatId)?.estimatedSizeFormatted || 'Variable'}
-                      </span>
-                    </div>
+                  <div className="mt-6 pt-5 border-t border-slate-800 flex flex-col gap-4">
+                    {/* Progress bar when downloading main format */}
+                    {activeDownloadKey === 'selected-format' && (
+                      <div className="w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 flex flex-col gap-2">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-300 font-medium flex items-center space-x-1.5">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-rose-500" />
+                            <span>{downloadStatusText || 'Downloading media...'}</span>
+                          </span>
+                          {downloadProgress !== null && (
+                            <span className="text-rose-400 font-mono font-semibold">{downloadProgress}%</span>
+                          )}
+                        </div>
+                        <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                          {downloadProgress !== null ? (
+                            <div 
+                              className="bg-gradient-to-r from-rose-500 to-amber-500 h-full transition-all duration-200 ease-out"
+                              style={{ width: `${downloadProgress}%` }}
+                            />
+                          ) : (
+                            <div className="bg-gradient-to-r from-rose-500 to-amber-500 h-full w-2/3 animate-pulse" />
+                          )}
+                        </div>
+                      </div>
+                    )}
 
-                    <button
-                      onClick={() => handleSingleDownload(selectedFormatId, video.title)}
-                      className="w-full sm:w-auto px-8 py-3 rounded-xl bg-gradient-to-r from-rose-600 to-red-500 hover:from-rose-500 hover:to-red-400 text-white font-medium text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-rose-600/30"
-                    >
-                      <Download className="w-4 h-4" />
-                      <span>Download Selected Format</span>
-                    </button>
+                    <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+                      <div className="text-xs text-slate-400">
+                        Selected: <span className="text-slate-200 font-medium">
+                          {video.formats.find(f => f.format_id === selectedFormatId)?.qualityLabel || 'Default'}
+                        </span>
+                        {' '}&bull;{' '}
+                        Size Guide: <span className="text-emerald-400 font-medium">
+                          {video.formats.find(f => f.format_id === selectedFormatId)?.estimatedSizeFormatted || 'Variable'}
+                        </span>
+                      </div>
+
+                      <button
+                        disabled={!!activeDownloadKey}
+                        onClick={() => handleSingleDownload(selectedFormatId, video.title, undefined, 'selected-format')}
+                        className="w-full sm:w-auto px-8 py-3 rounded-xl bg-gradient-to-r from-rose-600 to-red-500 hover:from-rose-500 hover:to-red-400 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-rose-600/30"
+                      >
+                        {activeDownloadKey === 'selected-format' ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span>Processing & Downloading...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Download className="w-4 h-4" />
+                            <span>Download Selected Format</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -652,18 +798,28 @@ export default function HomePage() {
                         {/* Individual track direct download button */}
                         <div className="flex items-center space-x-1.5 shrink-0">
                           <button
+                            disabled={!!activeDownloadKey}
                             title="Download single track as MP3"
-                            onClick={() => handleSingleDownload('mp3-high', item.title, item.url)}
-                            className="p-2 rounded-lg bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white transition-all text-xs"
+                            onClick={() => handleSingleDownload('mp3-high', item.title, item.url, `track-mp3-${item.id}`)}
+                            className="p-2 rounded-lg bg-slate-800 hover:bg-rose-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-300 hover:text-white transition-all text-xs"
                           >
-                            <FileAudio className="w-3.5 h-3.5" />
+                            {activeDownloadKey === `track-mp3-${item.id}` ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-rose-400" />
+                            ) : (
+                              <FileAudio className="w-3.5 h-3.5" />
+                            )}
                           </button>
                           <button
+                            disabled={!!activeDownloadKey}
                             title="Download single track as MP4"
-                            onClick={() => handleSingleDownload('best-mp4', item.title, item.url)}
-                            className="p-2 rounded-lg bg-slate-800 hover:bg-sky-600 text-slate-300 hover:text-white transition-all text-xs"
+                            onClick={() => handleSingleDownload('best-mp4', item.title, item.url, `track-mp4-${item.id}`)}
+                            className="p-2 rounded-lg bg-slate-800 hover:bg-sky-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-300 hover:text-white transition-all text-xs"
                           >
-                            <Film className="w-3.5 h-3.5" />
+                            {activeDownloadKey === `track-mp4-${item.id}` ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                            ) : (
+                              <Film className="w-3.5 h-3.5" />
+                            )}
                           </button>
                         </div>
                       </div>
