@@ -40,7 +40,10 @@ export async function GET(req: NextRequest) {
         '-x',
         '--audio-format', 'mp3',
         '--audio-quality', formatId.includes('high') ? '0' : '2',
-        '-f', 'ba/b'
+        '-f', 'ba/b',
+        '--embed-thumbnail',
+        '--embed-metadata',
+        '--convert-thumbnails', 'jpg'
       );
     } else {
       // Video mode
@@ -95,11 +98,16 @@ export async function GET(req: NextRequest) {
       throw new Error('Downloaded file was not created.');
     }
 
-    const downloadedFileName = files[0];
+    // Pick the actual media file (not leftover thumbnails/metadata)
+    const downloadedFileName =
+      files.find((f) => f.toLowerCase().endsWith(`.${outputExtension}`)) ||
+      files.find((f) => /\.(mp3|mp4|m4a|webm|mkv)$/i.test(f)) ||
+      files[0];
     const fullFilePath = path.join(sessionDir, downloadedFileName);
     const stats = fs.statSync(fullFilePath);
 
     const safeDownloadName = sanitizeFilename(customTitle || downloadedFileName.replace(/\.[^/.]+$/, '')) + path.extname(downloadedFileName);
+    const asciiDownloadName = safeDownloadName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
 
     // Stream file to response
     const fileStream = fs.createReadStream(fullFilePath);
@@ -122,7 +130,7 @@ export async function GET(req: NextRequest) {
       headers: {
         'Content-Type': contentType,
         'Content-Length': stats.size.toString(),
-        'Content-Disposition': `attachment; filename="${safeDownloadName}"; filename*=UTF-8''${encodedFilename}`,
+        'Content-Disposition': `attachment; filename="${asciiDownloadName}"; filename*=UTF-8''${encodedFilename}`,
         'Cache-Control': 'no-store',
       },
     });

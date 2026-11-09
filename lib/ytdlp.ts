@@ -1,9 +1,8 @@
-import path from 'path';
-import { spawn } from 'child_process';
-import fs from 'fs';
+import path from "path";
+import fs from "fs";
 
-export const YTDLP_PATH = path.join(process.cwd(), 'bin', 'yt-dlp');
-export const DOWNLOADS_TEMP_DIR = path.join(process.cwd(), '.temp_downloads');
+export const YTDLP_PATH = path.join(process.cwd(), "bin", "yt-dlp");
+export const DOWNLOADS_TEMP_DIR = path.join(process.cwd(), ".temp_downloads");
 
 if (!fs.existsSync(DOWNLOADS_TEMP_DIR)) {
   fs.mkdirSync(DOWNLOADS_TEMP_DIR, { recursive: true });
@@ -26,7 +25,7 @@ export interface FormatOption {
   format_note?: string;
   hasVideo: boolean;
   hasAudio: boolean;
-  type: 'video' | 'audio' | 'video+audio';
+  type: "video" | "audio" | "video+audio";
   estimatedSizeFormatted: string;
   qualityLabel: string;
 }
@@ -68,8 +67,8 @@ export interface PlaylistMetadata {
 }
 
 export function formatBytes(bytes?: number): string {
-  if (!bytes || bytes <= 0 || isNaN(bytes)) return 'Unknown size';
-  const units = ['B', 'KB', 'MB', 'GB'];
+  if (!bytes || bytes <= 0 || isNaN(bytes)) return "Unknown size";
+  const units = ["B", "KB", "MB", "GB"];
   let i = 0;
   let val = bytes;
   while (val >= 1024 && i < units.length - 1) {
@@ -80,16 +79,19 @@ export function formatBytes(bytes?: number): string {
 }
 
 export function formatDuration(sec?: number): string {
-  if (!sec || isNaN(sec)) return '--:--';
+  if (!sec || isNaN(sec)) return "--:--";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = Math.floor(sec % 60);
   if (h > 0) {
-    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   }
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 export function sanitizeFilename(name: string): string {
-  return name.replace(/[/\\?%*:|"<>]/g, '_').trim().slice(0, 150);
+  return name
+    .replace(/[/\\?%*:|"<>]/g, "_")
+    .trim()
+    .slice(0, 150);
 }

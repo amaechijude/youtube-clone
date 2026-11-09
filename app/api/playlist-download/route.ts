@@ -40,7 +40,10 @@ export async function POST(req: NextRequest) {
           '-x',
           '--audio-format', 'mp3',
           '--audio-quality', '0',
-          '-f', 'ba/b'
+          '-f', 'ba/b',
+          '--embed-thumbnail',
+          '--embed-metadata',
+          '--convert-thumbnails', 'jpg'
         );
       } else {
         // Video
@@ -78,6 +81,15 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Remove any leftover thumbnails/metadata files so the zip only contains media
+    try {
+      for (const f of fs.readdirSync(mediaDir)) {
+        if (!/\.(mp3|mp4|m4a|webm|mkv)$/i.test(f)) {
+          fs.rmSync(path.join(mediaDir, f), { force: true });
+        }
+      }
+    } catch {}
+
     // Verify downloaded files
     const downloadedFiles = fs.readdirSync(mediaDir);
     if (!downloadedFiles || downloadedFiles.length === 0) {
@@ -86,6 +98,7 @@ export async function POST(req: NextRequest) {
 
     // Create a zip archive using Linux 'zip' utility
     const safeZipName = `${sanitizeFilename(playlistTitle || 'YouTube_Playlist')}_${isMp3Export ? 'MP3' : 'MP4'}.zip`;
+    const asciiZipName = safeZipName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
     const zipFilePath = path.join(sessionDir, safeZipName);
 
     await new Promise<void>((resolve, reject) => {
@@ -120,7 +133,7 @@ export async function POST(req: NextRequest) {
       headers: {
         'Content-Type': 'application/zip',
         'Content-Length': zipStats.size.toString(),
-        'Content-Disposition': `attachment; filename="${safeZipName}"; filename*=UTF-8''${encodedZipName}`,
+        'Content-Disposition': `attachment; filename="${asciiZipName}"; filename*=UTF-8''${encodedZipName}`,
         'Cache-Control': 'no-store',
       },
     });
