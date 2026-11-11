@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body.' }, { status: 400 });
   }
 
-  const { items, playlistTitle, format = 'mp3', quality } = body;
+  const { items, playlistTitle, format = 'mp3', quality, mode: deliveryMode = 'zip' } = body;
   if (!items || !Array.isArray(items) || items.length === 0) {
     return NextResponse.json({ error: 'No items selected for download.' }, { status: 400 });
   }
@@ -67,7 +67,10 @@ export async function POST(req: NextRequest) {
       };
 
       try {
-        console.log(`[Playlist Download] Starting batch of ${items.length} items (format: ${format})`);
+        console.log(`[Playlist Download] Starting batch of ${items.length} items (format: ${format}, mode: ${deliveryMode})`);
+        // Announce the session id up front so the client can start fetching
+        // individually finished files before the batch completes.
+        send({ type: 'start', sessionId, mode: deliveryMode });
         send({ type: 'phase', phase: 'downloading' });
 
         // Download a single item. Always resolves; failures are reported via the
@@ -77,8 +80,12 @@ export async function POST(req: NextRequest) {
           // The client indexes progress bars by the original playlist row index,
           // so pass it through even though the batch order may differ.
           const entryIndex = typeof item.entryIndex === 'number' ? item.entryIndex : index;
-          const sendItem = (status: string, percent?: number, error?: string) => {
-            send({ type: 'item', index: entryIndex, title: item.title, status, percent, ...(error ? { error } : {}) });
+          const sendItem = (status: string, percent?: number, error?: string, fileName?: string) => {
+            send({
+              type: 'item', index: entryIndex, title: item.title, status, percent,
+              ...(error ? { error } : {}),
+              ...(fileName ? { fileName } : {}),
+            });
           };
 
           const itemIndexStr = String(index + 1).padStart(2, '0');
@@ -123,6 +130,19 @@ export async function POST(req: NextRequest) {
 
           sendItem('queued', 0);
 
+          // Locate the finished media file for this item so the client can
+          // download it individually in "files" delivery mode.
+          const findOutputFile = () => {
+            try {
+              const prefix = `${itemIndexStr} - ${itemTitle}`;
+              return fs.readdirSync(mediaDir)
+                .filter((f) => f.startsWith(prefix) && /\.(mp3|mp4|m4a|webm|mkv)$/i.test(f))
+                .sort()[0];
+            } catch {
+              return undefined;
+            }
+          };
+
           let settled = false;
           const finish = (error?: string) => {
             if (settled) return;
@@ -130,7 +150,7 @@ export async function POST(req: NextRequest) {
             if (error) {
               sendItem('failed', undefined, error);
             } else {
-              sendItem('done', 100);
+              sendItem('done', 100, undefined, findOutputFile());
             }
             resolve({ ok: !error });
           };
@@ -217,6 +237,29 @@ export async function POST(req: NextRequest) {
           return;
         }
 
+        if (deliveryMode === 'files') {
+          // Individual file delivery: no zip. The client fetches each completed
+          // file from /api/playlist-item as soon as its "done" event arrives.
+          // Register the session so cleanup logic keeps files until fetched/TTL.
+          pendingZips.set(sessionId, {
+            zipPath: sessionDir,
+            zipName: '',
+            createdAt: Date.now(),
+          });
+
+          send({
+            type: 'complete',
+            sessionId,
+            mode: 'files',
+            succeeded: succeededCount,
+            failed: failedCount,
+          });
+
+          closed = true;
+          try { controller.close(); } catch {}
+          return;
+        }
+
         send({ type: 'phase', phase: 'zipping' });
 
         // Create a zip archive using Linux 'zip' utility
@@ -250,6 +293,7 @@ export async function POST(req: NextRequest) {
         send({
           type: 'complete',
           sessionId,
+          mode: 'zip',
           zipName: safeZipName,
           asciiZipName,
           zipSize: fs.statSync(zipFilePath).size,
@@ -270,7 +314,9 @@ export async function POST(req: NextRequest) {
       }
     },
     cancel() {
-      // Client aborted mid-stream: discard temp files and any pending registration
+      // Client aborted mid-stream: discard temp files — but only if the batch
+      // has not finished yet; completed sessions keep their artifacts for pickup.
+      if (pendingZips.has(sessionId)) return;
       try {
         fs.rmSync(sessionDir, { recursive: true, force: true });
       } catch {}

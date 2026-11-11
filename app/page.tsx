@@ -95,6 +95,8 @@ export default function HomePage() {
   type ExportItemStatus = 'queued' | 'downloading' | 'processing' | 'done' | 'failed';
   const [exportItemProgress, setExportItemProgress] = useState<Record<number, { status: ExportItemStatus; percent: number }>>({});
   const [exportPhase, setExportPhase] = useState<'downloading' | 'zipping'>('downloading');
+  const [exportMode, setExportMode] = useState<'zip' | 'files'>('zip');
+  const [savedFilesCount, setSavedFilesCount] = useState(0);
 
   // Handle URL analyze
   const handleAnalyze = async (e?: React.FormEvent) => {
@@ -247,8 +249,10 @@ export default function HomePage() {
     }, 2000);
   };
 
-  // Trigger playlist batch zip download with live per-file progress
-  const handlePlaylistExport = async () => {
+  // Trigger playlist batch download with live per-file progress.
+  // mode === 'zip'   -> stream progress, then fetch one ZIP archive
+  // mode === 'files' -> each finished file is fetched individually (no ZIP)
+  const handlePlaylistExport = async (mode: 'zip' | 'files' = 'zip') => {
     if (!result || !result.isPlaylist) return;
 
     const chosenItems = result.entries.filter((item) => selectedItems[item.id]);
@@ -258,8 +262,40 @@ export default function HomePage() {
     }
 
     setIsExportingPlaylist(true);
+    setExportMode(mode);
     setExportItemProgress({});
+    setSavedFilesCount(0);
     setExportPhase('downloading');
+
+    // Sequential queue for individual file downloads: as soon as the server
+    // reports a file is done, it is fetched and saved to disk.
+    const fileQueue: Array<string> = [];
+    let queueRunning = false;
+    let fileSessionId = '';
+    let queueErrors = 0;
+
+    const pumpQueue = async () => {
+      if (queueRunning) return;
+      queueRunning = true;
+      while (fileQueue.length > 0) {
+        const fileName = fileQueue.shift()!;
+        try {
+          const res = await fetch(
+            `/api/playlist-item?session=${encodeURIComponent(fileSessionId)}&file=${encodeURIComponent(fileName)}`
+          );
+          if (!res.ok) {
+            queueErrors++;
+            continue;
+          }
+          const blob = await res.blob();
+          triggerBlobDownload(blob, fileName);
+          setSavedFilesCount((c) => c + 1);
+        } catch {
+          queueErrors++;
+        }
+      }
+      queueRunning = false;
+    };
 
     try {
       // Attach the original row index so progress events can be matched back
@@ -276,6 +312,7 @@ export default function HomePage() {
           playlistTitle: result.title,
           format: playlistExportFormat,
           quality: playlistQuality,
+          mode,
           items: payloadItems,
         }),
       });
@@ -300,9 +337,12 @@ export default function HomePage() {
       let buffer = '';
       let zipSessionId: string | null = null;
       let zipName = '';
+      let filesModeComplete = false;
 
       const handleEvent = (evt: any) => {
-        if (evt.type === 'item' && typeof evt.index === 'number') {
+        if (evt.type === 'start' && typeof evt.sessionId === 'string') {
+          fileSessionId = evt.sessionId;
+        } else if (evt.type === 'item' && typeof evt.index === 'number') {
           setExportItemProgress((prev) => ({
             ...prev,
             [evt.index]: {
@@ -310,10 +350,16 @@ export default function HomePage() {
               percent: typeof evt.percent === 'number' ? evt.percent : 0,
             },
           }));
+          // In files mode, start downloading the moment a file is ready
+          if (mode === 'files' && evt.status === 'done' && evt.fileName) {
+            fileQueue.push(evt.fileName);
+            void pumpQueue();
+          }
         } else if (evt.type === 'phase') {
           if (evt.phase === 'zipping') setExportPhase('zipping');
         } else if (evt.type === 'complete') {
           zipSessionId = evt.sessionId;
+          filesModeComplete = evt.mode === 'files';
           zipName = evt.zipName || `${result!.title || 'Playlist'}_${playlistExportFormat.toUpperCase()}.zip`;
         } else if (evt.type === 'error') {
           throw new Error(evt.message || 'Playlist export failed.');
@@ -347,15 +393,39 @@ export default function HomePage() {
         throw new Error('Export finished but no archive was produced.');
       }
 
-      // Fetch the finished zip in a separate request
-      const zipRes = await fetch(`/api/playlist-file?session=${encodeURIComponent(zipSessionId)}`);
-      if (!zipRes.ok) {
-        let errorMsg = 'Failed to download the ZIP archive.';
+      if (filesModeComplete) {
+        // Files mode: downloads are handled by the queue. Warn if some failed.
+        if (queueErrors > 0) {
+          alert(`Export finished, but ${queueErrors} file(s) could not be saved. Check your browser's download settings.`);
+        }
+        return;
+      }
+
+      // Zip mode: fetch the finished archive (one retry on transient failures)
+      let zipRes: Response | null = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const errJson = await zipRes.json();
-          errorMsg = errJson.error || errorMsg;
-        } catch {}
-        throw new Error(errorMsg);
+          const res = await fetch(`/api/playlist-file?session=${encodeURIComponent(zipSessionId)}`);
+          if (res.ok) {
+            zipRes = res;
+            break;
+          }
+          if (attempt === 1) {
+            let errorMsg = `ZIP download failed (HTTP ${res.status}).`;
+            try {
+              const errJson = await res.clone().json();
+              errorMsg = errJson.error || errorMsg;
+            } catch {}
+            throw new Error(errorMsg);
+          }
+        } catch (e: any) {
+          if (attempt === 1) throw new Error(e?.message || 'Failed to download the ZIP archive.');
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (!zipRes) {
+        throw new Error('Failed to download the ZIP archive.');
       }
 
       const blob = await zipRes.blob();
@@ -366,6 +436,7 @@ export default function HomePage() {
       setIsExportingPlaylist(false);
       // Keep the per-file results visible briefly, then clear
       setTimeout(() => setExportItemProgress({}), 4000);
+      setTimeout(() => setSavedFilesCount(0), 6000);
     }
   };
 
@@ -790,11 +861,30 @@ export default function HomePage() {
                       </button>
 
                       <button
-                        onClick={handlePlaylistExport}
+                        onClick={() => handlePlaylistExport('files')}
                         disabled={isExportingPlaylist || selectedCount === 0}
-                        className="ml-auto px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white font-medium text-xs flex items-center space-x-2 shadow-lg shadow-emerald-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                        className="ml-auto px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-medium text-xs flex items-center space-x-2 shadow disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                        title="Downloads each file to your device as soon as it finishes converting, without zipping. Your browser may ask for permission to download multiple files."
                       >
-                        {isExportingPlaylist ? (
+                        {isExportingPlaylist && exportMode === 'files' ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span>Saved {savedFilesCount} file{savedFilesCount === 1 ? '' : 's'}...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Download className="w-4 h-4" />
+                            <span>Download Files (No ZIP)</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => handlePlaylistExport('zip')}
+                        disabled={isExportingPlaylist || selectedCount === 0}
+                        className={`px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white font-medium text-xs flex items-center space-x-2 shadow-lg shadow-emerald-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all ${isExportingPlaylist && exportMode === 'files' ? '' : 'ml-auto'}`}
+                      >
+                        {isExportingPlaylist && exportMode === 'zip' ? (
                           <>
                             <Loader2 className="w-4 h-4 animate-spin" />
                             <span>
