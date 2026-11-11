@@ -91,6 +91,10 @@ export default function HomePage() {
   const [playlistExportFormat, setPlaylistExportFormat] = useState<'mp3' | 'mp4'>('mp3');
   const [playlistQuality, setPlaylistQuality] = useState<string>('1080');
   const [isExportingPlaylist, setIsExportingPlaylist] = useState(false);
+  // Live per-file progress during playlist export, keyed by the playlist row index.
+  type ExportItemStatus = 'queued' | 'downloading' | 'processing' | 'done' | 'failed';
+  const [exportItemProgress, setExportItemProgress] = useState<Record<number, { status: ExportItemStatus; percent: number }>>({});
+  const [exportPhase, setExportPhase] = useState<'downloading' | 'zipping'>('downloading');
 
   // Handle URL analyze
   const handleAnalyze = async (e?: React.FormEvent) => {
@@ -243,7 +247,7 @@ export default function HomePage() {
     }, 2000);
   };
 
-  // Trigger playlist batch zip download
+  // Trigger playlist batch zip download with live per-file progress
   const handlePlaylistExport = async () => {
     if (!result || !result.isPlaylist) return;
 
@@ -254,8 +258,17 @@ export default function HomePage() {
     }
 
     setIsExportingPlaylist(true);
+    setExportItemProgress({});
+    setExportPhase('downloading');
 
     try {
+      // Attach the original row index so progress events can be matched back
+      // to the correct track in the UI.
+      const payloadItems = result.entries
+        .map((item, index) => ({ item, index }))
+        .filter(({ item }) => selectedItems[item.id])
+        .map(({ item, index }) => ({ ...item, entryIndex: index }));
+
       const response = await fetch('/api/playlist-download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -263,29 +276,96 @@ export default function HomePage() {
           playlistTitle: result.title,
           format: playlistExportFormat,
           quality: playlistQuality,
-          items: chosenItems,
+          items: payloadItems,
         }),
       });
 
       if (!response.ok) {
-        const errJson = await response.json();
-        throw new Error(errJson.error || 'Failed to generate playlist package.');
+        let errorMsg = 'Failed to generate playlist package.';
+        try {
+          const errJson = await response.json();
+          errorMsg = errJson.error || errorMsg;
+        } catch {}
+        throw new Error(errorMsg);
       }
 
-      // Convert to blob and download
-      const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = `${result.title || 'Playlist'}_${playlistExportFormat.toUpperCase()}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
+      if (!response.body) {
+        throw new Error('Streaming is not supported by this browser.');
+      }
+
+      // The server streams newline-delimited JSON progress events, one per
+      // update, followed by a final "complete" or "error" event.
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let zipSessionId: string | null = null;
+      let zipName = '';
+
+      const handleEvent = (evt: any) => {
+        if (evt.type === 'item' && typeof evt.index === 'number') {
+          setExportItemProgress((prev) => ({
+            ...prev,
+            [evt.index]: {
+              status: evt.status || 'queued',
+              percent: typeof evt.percent === 'number' ? evt.percent : 0,
+            },
+          }));
+        } else if (evt.type === 'phase') {
+          if (evt.phase === 'zipping') setExportPhase('zipping');
+        } else if (evt.type === 'complete') {
+          zipSessionId = evt.sessionId;
+          zipName = evt.zipName || `${result!.title || 'Playlist'}_${playlistExportFormat.toUpperCase()}.zip`;
+        } else if (evt.type === 'error') {
+          throw new Error(evt.message || 'Playlist export failed.');
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt;
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          handleEvent(evt);
+        }
+      }
+      if (buffer.trim()) {
+        try {
+          handleEvent(JSON.parse(buffer));
+        } catch {}
+      }
+
+      if (!zipSessionId) {
+        throw new Error('Export finished but no archive was produced.');
+      }
+
+      // Fetch the finished zip in a separate request
+      const zipRes = await fetch(`/api/playlist-file?session=${encodeURIComponent(zipSessionId)}`);
+      if (!zipRes.ok) {
+        let errorMsg = 'Failed to download the ZIP archive.';
+        try {
+          const errJson = await zipRes.json();
+          errorMsg = errJson.error || errorMsg;
+        } catch {}
+        throw new Error(errorMsg);
+      }
+
+      const blob = await zipRes.blob();
+      triggerBlobDownload(blob, zipName);
     } catch (err: any) {
       alert(`Export error: ${err.message}`);
     } finally {
       setIsExportingPlaylist(false);
+      // Keep the per-file results visible briefly, then clear
+      setTimeout(() => setExportItemProgress({}), 4000);
     }
   };
 
@@ -717,7 +797,15 @@ export default function HomePage() {
                         {isExportingPlaylist ? (
                           <>
                             <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Packaging ZIP archive...</span>
+                            <span>
+                              {exportPhase === 'zipping'
+                                ? 'Packaging ZIP archive...'
+                                : (() => {
+                                    const statuses = Object.values(exportItemProgress);
+                                    const finished = statuses.filter(p => p.status === 'done' || p.status === 'failed').length;
+                                    return `Downloading ${finished}/${statuses.length || selectedCount} files...`;
+                                  })()}
+                            </span>
                           </>
                         ) : (
                           <>
@@ -783,6 +871,43 @@ export default function HomePage() {
                               {item.duration_string}
                             </span>
                           </div>
+
+                          {/* Live per-file download progress during playlist export */}
+                          {isExportingPlaylist && isChecked && exportItemProgress[index] && (() => {
+                            const p = exportItemProgress[index];
+                            const pct = p.status === 'done' || p.status === 'failed' ? 100 : (p.percent || 0);
+                            const isDone = p.status === 'done';
+                            const isFailed = p.status === 'failed';
+                            const label =
+                              p.status === 'queued' ? 'Queued...'
+                              : p.status === 'downloading' ? `Downloading ${pct}%`
+                              : p.status === 'processing' ? 'Converting...'
+                              : isDone ? 'Done'
+                              : 'Failed';
+                            return (
+                              <div className="mt-1.5 flex items-center gap-2">
+                                <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                  <div
+                                    className={`h-full transition-all duration-200 ease-out ${
+                                      isFailed
+                                        ? 'bg-rose-500'
+                                        : isDone
+                                        ? 'bg-emerald-500'
+                                        : 'bg-gradient-to-r from-rose-500 to-amber-500'
+                                    }`}
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                </div>
+                                <span
+                                  className={`text-[10px] font-mono shrink-0 ${
+                                    isFailed ? 'text-rose-400' : isDone ? 'text-emerald-400' : 'text-rose-300'
+                                  }`}
+                                >
+                                  {label}
+                                </span>
+                              </div>
+                            );
+                          })()}
                         </div>
 
                         {/* Size guide badge */}
