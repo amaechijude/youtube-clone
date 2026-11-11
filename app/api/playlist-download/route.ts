@@ -23,11 +23,11 @@ export async function POST(req: NextRequest) {
     const isMp3Export = format === 'mp3';
     console.log(`[Playlist Download] Starting batch of ${items.length} items (format: ${format})`);
 
-    // Download items sequentially or in batches of 2 to avoid YouTube rate limits
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const itemIndexStr = String(i + 1).padStart(2, '0');
-      const itemTitle = sanitizeFilename(item.title || `Track ${i + 1}`);
+    // Download a single item. Always resolves; failures are reported via the
+    // returned result so one bad item never aborts the rest of the batch.
+    const downloadItem = (item: any, index: number): Promise<{ ok: boolean; title: string; error?: string }> => {
+      const itemIndexStr = String(index + 1).padStart(2, '0');
+      const itemTitle = sanitizeFilename(item.title || `Track ${index + 1}`);
 
       const args = [
         '--js-runtimes', 'node',
@@ -63,23 +63,54 @@ export async function POST(req: NextRequest) {
       const outName = `${itemIndexStr} - ${itemTitle}.%(ext)s`;
       args.push('-o', path.join(mediaDir, outName), item.url);
 
-      try {
-        await new Promise<void>((resolve, reject) => {
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (error?: string) => {
+          if (settled) return;
+          settled = true;
+          resolve({ ok: !error, title: item.title || `Track ${index + 1}`, error });
+        };
+
+        try {
           const proc = spawn(YTDLP_PATH, args);
           let errText = '';
           proc.stderr.on('data', (d) => { errText += d.toString(); });
+          proc.on('error', (err) => finish(err.message || 'Failed to start yt-dlp'));
           proc.on('close', (code) => {
             if (code !== 0) {
               console.warn(`[Playlist Item Error] ${item.title}: ${errText}`);
+              finish(`yt-dlp exited with code ${code}`);
+            } else {
+              finish();
             }
-            // Continue even if one fails
-            resolve();
           });
-        });
-      } catch (e) {
-        console.warn(`Failed on item ${i}:`, e);
+        } catch (e: any) {
+          console.warn(`Failed on item ${index}:`, e);
+          finish(e?.message || 'Unexpected error');
+        }
+      });
+    };
+
+    // Run downloads in parallel with a bounded worker pool: parallelism speeds
+    // things up, while the cap keeps us under YouTube's rate limits.
+    const MAX_PARALLEL = Math.min(4, items.length);
+    const results: Array<{ ok: boolean; title: string; error?: string }> = new Array(items.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+      while (nextIndex < items.length) {
+        const i = nextIndex++;
+        results[i] = await downloadItem(items[i], i);
       }
-    }
+    };
+
+    await Promise.all(Array.from({ length: MAX_PARALLEL }, () => worker()));
+
+    const failed = results.filter((r) => r && !r.ok);
+    console.log(
+      `[Playlist Download] Batch finished: ${items.length - failed.length} succeeded, ${failed.length} failed` +
+      (failed.length ? ` (${failed.map((f) => f.title).join(', ')})` : '')
+    );
 
     // Remove any leftover thumbnails/metadata files so the zip only contains media
     try {
