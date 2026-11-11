@@ -30,13 +30,32 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  const zipFile = fs.readdirSync(zipPath).find((f) => f.endsWith('.zip'));
+  // If the stored path is the zip file itself rather than the session directory
+  // (e.g. a registry entry written by an older version), normalize to its folder.
+  try {
+    if (fs.statSync(zipPath).isFile()) zipPath = path.dirname(zipPath);
+  } catch {
+    return NextResponse.json({ error: 'Download session not found or expired.' }, { status: 404 });
+  }
+
+  const zipFile = (() => {
+    try {
+      return fs.readdirSync(zipPath).find((f) => f.endsWith('.zip'));
+    } catch {
+      return undefined;
+    }
+  })();
   if (!zipFile) {
     return NextResponse.json({ error: 'Archive not found for this session.' }, { status: 404 });
   }
 
   const zipFilePath = path.join(zipPath, zipFile);
-  const zipStats = fs.statSync(zipFilePath);
+  let zipStats: fs.Stats;
+  try {
+    zipStats = fs.statSync(zipFilePath);
+  } catch {
+    return NextResponse.json({ error: 'Archive is not accessible.' }, { status: 500 });
+  }
   const asciiZipName = zipFile.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
   const encodedZipName = encodeURIComponent(zipFile);
 

@@ -25,7 +25,7 @@ function cleanupStaleZips() {
   for (const [id, entry] of pendingZips) {
     if (now - entry.createdAt > ZIP_TTL_MS) {
       try {
-        fs.rmSync(path.dirname(entry.zipPath), { recursive: true, force: true });
+        fs.rmSync(entry.zipPath, { recursive: true, force: true });
       } catch {}
       pendingZips.delete(id);
     }
@@ -239,9 +239,10 @@ export async function POST(req: NextRequest) {
           return;
         }
 
-        // Keep the zip on disk so the client can pick it up via /api/playlist-file
+        // Keep the zip on disk so the client can pick it up via /api/playlist-file.
+        // Store the session DIRECTORY — the file route lists it to find the zip.
         pendingZips.set(sessionId, {
-          zipPath: zipFilePath,
+          zipPath: sessionDir,
           zipName: safeZipName,
           createdAt: Date.now(),
         });
